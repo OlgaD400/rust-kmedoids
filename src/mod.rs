@@ -30,6 +30,7 @@
 //! ```
 mod alternating;
 pub mod arrayadapter;
+pub  mod arrayadapter3d;
 mod fasterpam;
 mod fastpam1;
 mod fastmsc;
@@ -48,6 +49,7 @@ mod util;
 
 pub use crate::alternating::*;
 pub use crate::arrayadapter::ArrayAdapter;
+pub use crate::arrayadapter3d::ArrayAdapter3d;
 pub use crate::fasterpam::*;
 pub use crate::fastpam1::*;
 pub use crate::fastmsc::*;

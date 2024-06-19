@@ -12,7 +12,7 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/kno10/rust-kmedoids"
 
 [lib]
-name = "kmedoids"
+name = "rustkmedoids"
 path = "src/mod.rs"
 test = true
 doc = true

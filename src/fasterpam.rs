@@ -1,8 +1,14 @@
 use crate::arrayadapter::ArrayAdapter;
+use crate::arrayadapter3d::ArrayAdapter3d;
 use crate::util::*;
 use core::ops::AddAssign;
 use num_traits::{Signed, Zero};
 use std::convert::From;
+use ndarray::Array3;
+use ndarray::Array2;
+use ndarray::Array1;
+use ndarray::Axis;
+use std::ops::Range;
 
 /// Run the FasterPAM algorithm.
 ///
@@ -170,6 +176,149 @@ where
 	(loss, assi, iter, n_swaps)
 }
 
+#[cfg(feature = "rand")]
+pub fn fasterpam_time<M,N,L>(
+	mat: &M,
+	medioids: &mut Vec<usize>,
+	maxiter: usize,
+	drift_time_window: usize,
+	max_drift: usize,
+	rng: &mut impl rand::Rng,
+	online: bool,
+	) -> (L, Array2<usize>, usize, usize, Array2<usize>)
+where
+N: Zero + PartialOrd + Copy + From<f64>,
+L: AddAssign + Signed + Zero + PartialOrd + Copy + From<N>,
+M: ArrayAdapter3d<N>,
+{
+	// Get data dimensions
+	let t: usize = mat.get_dim_size(0);
+	let n: usize = mat.get_dim_size(1);
+	let k: usize = medioids.len();
+
+	let mut total_assignments = Array2::<usize>::zeros((t, n));
+	let mut total_medioids = Array2::<usize>::zeros((t, k));
+	
+	let mut start: usize = 1;
+	if !online{
+		// Get first time slice
+		let distance_init = mat.single_slice(0);
+		let (_loss, assi, _iter, _n_swaps): (L, Vec<usize>, usize, usize)  = rand_fasterpam(&distance_init, medioids, maxiter, rng);
+		
+		let init_med_array = Array1::from(medioids.clone().into_boxed_slice().into_vec());
+		let init_assi_array = Array1::from(assi);
+
+		total_medioids.row_mut(0).assign(&init_med_array);
+		total_assignments.row_mut(0).assign(&init_assi_array);
+
+		}
+	else{
+		start = 0;
+	}
+
+	for time in start..t{
+		let curr_distance = mat.single_slice(time);
+		let mut removal_loss = vec![L::zero(); k];
+		let (mut _loss, mut assignment) : (L, Vec<Rec<N>>) = initial_assignment(&curr_distance, medioids);
+
+		update_removal_loss(&assignment, &mut removal_loss);
+
+		let curr_mediods = medioids.clone();
+		
+		//randomly shuffle the medioids
+		let med_seq = rand::seq::index::sample(rng, k, k); // random shuffling
+		
+		//for (medioid_index, medioid) in curr_mediods.iter().enumerate(){
+		for medioid_index in med_seq.iter(){
+			let medioid = curr_mediods[medioid_index];
+
+			let medioid_connections = find_center_connections::<M,N,L>(
+				medioid,
+				mat, 
+				time, 
+				drift_time_window,
+				max_drift,
+			);
+
+			//randomly shuffle the medioid connections
+			let connections_len = medioid_connections.len();
+			let connections_seq = rand::seq::index::sample(rng, connections_len, connections_len);
+
+			// for connection in mediod_connections.iter(){
+			for connection_index in connections_seq.iter(){
+				let connection = medioid_connections[connection_index];
+				if connection == medioids[assignment[connection].near.i as usize] {
+					continue; // This already is a medoid
+			}
+				let (change, b) = find_swap_for_medioid(
+					&curr_distance,
+					&mut removal_loss,
+					&assignment,
+					connection, 
+					medioid_index,
+				);
+
+				if change >= L::zero() {
+					continue; // No improvement
+				}
+				// perform the swap
+				let _loss: L = do_swap(&curr_distance, medioids, &mut assignment, b, connection);
+				update_removal_loss(&assignment, &mut removal_loss);
+				}
+			}
+		let assi: Vec<usize> = assignment.iter().map(|x| x.near.i as usize).collect();
+		
+		let init_med_array = Array1::from(medioids.clone().into_boxed_slice().into_vec());
+		let init_assi_array = Array1::from(assi);
+		total_medioids.row_mut(time).assign(&init_med_array);
+		total_assignments.row_mut(time).assign(&init_assi_array);
+
+	}
+	// Store assi in some 3D struct
+	(L::zero(), total_assignments, 0, 0, total_medioids)
+}
+
+// Find center connections
+#[inline]
+pub(crate) fn find_center_connections<M,N,L> (
+    current_center: usize,
+    distance_matrix: &M,
+    time: usize,
+    drift_time_window: usize,
+    max_drift: usize,
+) -> Vec<usize>
+where 
+N: Zero + PartialOrd + Copy + From<f64>,
+M: ArrayAdapter3d<N>,
+L: AddAssign + Signed + Zero + PartialOrd + Copy + From<N>,
+
+{
+    let num_points = distance_matrix.get_dim_size(1);
+	
+	// Distances matrices for "center connectivity" previous time steps
+	let slice_range: Range<usize>;
+
+	if time<drift_time_window{
+		slice_range = 0..time;
+	}
+	else{
+		slice_range = (time - drift_time_window)..time;
+	}
+
+    let drift_time_slices: Array3<N> =
+        distance_matrix.multi_slice(slice_range);
+	
+	let target_sum: f64 = max_drift as f64 * f64::min(time as f64 , drift_time_window as f64);
+
+	// let target_sum: u32 = max_drift * min(time , drift_time_window);
+
+	let sum_distances = drift_time_slices.index_axis(Axis(1), current_center).sum_axis(Axis(0));
+	let connected_vertices: Vec<usize> = (0..num_points).filter(|&i| sum_distances[i] <= N::from(target_sum)).collect();
+	connected_vertices  
+
+    // center_connections
+}
+
 /// Perform the initial assignment to medoids
 #[inline]
 pub(crate) fn initial_assignment<M, N, L>(mat: &M, med: &[usize]) -> (L, Vec<Rec<N>>)
@@ -205,6 +354,43 @@ where
 		.reduce(L::add)
 		.unwrap();
 	(loss, data)
+}
+
+/// Find the best swap for object j - FastPAM version
+#[inline]
+pub(crate) fn find_swap_for_medioid<M, N, L>(
+	mat: &M,
+	removal_loss: &[L],
+	data: &[Rec<N>],
+	j: usize,
+	med_to_replace_index: usize,
+) -> (L, usize)
+where
+	N: Zero + PartialOrd + Copy,
+	L: AddAssign + Signed + Zero + PartialOrd + Copy + From<N>,
+	M: ArrayAdapter<N>,
+{
+	let mut ploss = removal_loss.to_vec();
+
+	
+	// Improvement from the journal version:
+	let mut acc = L::zero();
+	for (o, reco) in data.iter().enumerate() {
+		let doj = mat.get(o, j);
+		// New medoid is closest:
+		if doj < reco.near.d {
+			acc += L::from(doj) - L::from(reco.near.d);
+			// loss already includes ds - dn, remove
+			ploss[reco.near.i as usize] += L::from(reco.near.d) - L::from(reco.seco.d);
+		} else if doj < reco.seco.d {
+			// loss already includes ds - dn, adjust to d(xo) - dn
+			ploss[reco.near.i as usize] += L::from(doj) - L::from(reco.seco.d);
+		}
+	}
+	// let (b, bloss) = find_min(&mut ploss.iter());
+	// Find index and value for med_to_replace 
+	let med_loss = ploss[med_to_replace_index];
+	(med_loss + acc, med_to_replace_index) // add the shared accumulator
 }
 
 /// Find the best swap for object j - FastPAM version
@@ -396,5 +582,28 @@ mod tests {
 		assert_array(assi, vec![0, 0, 0, 1, 1], "assignment not as expected");
 		assert_array(meds, vec![0, 4], "medoids not as expected");
 		assert_eq!(sil, 0.7522494172494172, "Silhouette not as expected");
+	}
+
+	#[cfg(feature = "rand")]
+	// use crate::fasterpam_time;
+	#[test]
+	fn test_center_connections() {
+    use crate::find_center_connections;
+
+		let distance_matrix: ndarray::prelude::ArrayBase<ndarray::OwnedRepr<f64>, ndarray::prelude::Dim<[usize; 3]>> = ndarray::Array3::from_shape_vec((4, 4, 4), vec![
+        0.0, 3.0, 1.0, 2.0, 3.0, 0.0, 2.0, 3.0,
+        1.0, 2.0, 0.0, 3.0, 2.0, 3.0, 3.0, 0.0,
+        0.0, 3.0, 1.0, 2.0, 3.0, 0.0, 2.0, 3.0,
+        1.0, 2.0, 0.0, 3.0, 2.0, 3.0, 3.0, 0.0,
+        0.0, 3.0, 1.0, 2.0, 3.0, 0.0, 2.0, 3.0,
+        1.0, 2.0, 0.0, 3.0, 2.0, 3.0, 3.0, 0.0,
+        0.0, 3.0, 1.0, 2.0, 3.0, 0.0, 2.0, 3.0,
+        1.0, 2.0, 0.0, 3.0, 2.0, 3.0, 3.0, 0.0,]).unwrap();
+		
+		let connections: Vec<usize> = find_center_connections::<ndarray::prelude::ArrayBase<ndarray::OwnedRepr<f64>, ndarray::Dim<[usize; 3]>>, f64, f64>(2, &distance_matrix, 2, 2, 2);
+		assert_array(connections, vec![0,1,2], "connections not as expected");
+		
+		let connections: Vec<usize> = find_center_connections::<ndarray::prelude::ArrayBase<ndarray::OwnedRepr<f64>, ndarray::Dim<[usize; 3]>>, f64, f64>( 3, &distance_matrix, 2, 2, 2);
+		assert_array(connections, vec![0,3], "connections not as expected");
 	}
 }
